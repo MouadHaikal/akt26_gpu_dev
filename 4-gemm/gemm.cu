@@ -1,4 +1,3 @@
-
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -8,6 +7,24 @@
 #include <cstdlib>
 #include <vector>
 
+#define CUDA_CHECK(call) do { \
+    const cudaError_t status = (call); \
+    if (status != cudaSuccess) { \
+        std::fprintf(stderr, "%s:%d: %s: %s\n", __FILE__, __LINE__, \
+                     #call, cudaGetErrorString(status)); \
+        std::exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+#define CUBLAS_CHECK(call) do { \
+    const cublasStatus_t status = (call); \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        std::fprintf(stderr, "%s:%d: %s: cuBLAS error %d\n", \
+                     __FILE__, __LINE__, #call, (int)status); \
+        std::exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
 ////////////////////////////////////////////////////////////////////////////////
 // Custom batched GEMM
 //
@@ -16,29 +33,45 @@
 // Matrices are N x N, column-major.
 ////////////////////////////////////////////////////////////////////////////////
 __global__ void batch_gemm_kernel(int n, int batch_size,
-                                    const float* A,
-                                    const float* B,
-                                    float* C)
+                                  const float* A, const float* B, float* C)
 {
-    // TODO: write your own kernel here
+    // One n-by-n block per matrix, one output element per thread (n <= 32).
+    const int batch = blockIdx.x;
+    if (batch >= batch_size) {
+        return;
+    }
+
+    const int row = threadIdx.x;
+    const int col = threadIdx.y;
+    const size_t base = (size_t)batch * n * n;
+    const size_t index = base + (size_t)col * n + row;
+
+    // Store tiles as [column][row] to match the input layout.
+    __shared__ float tile_A[32][32];
+    __shared__ float tile_B[32][32];
+    tile_A[col][row] = A[index];
+    tile_B[col][row] = B[index];
+    __syncthreads();
+
+    float sum = 0.0f;
+    for (int k = 0; k < n; ++k) {
+        sum = fmaf(tile_A[k][row], tile_B[col][k], sum);
+    }
+    C[index] = sum;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // CPU reference implementation
 void batched_gemm_cpu(int n, int batch_size,
-                      const float* A,
-                      const float* B,
-                      float* C)
+                      const float* A, const float* B, float* C)
 {
     const size_t matrix_size = (size_t)n * n;
 
     for (int b = 0; b < batch_size; ++b) {
-
         const size_t base = (size_t)b * matrix_size;
 
         for (int col = 0; col < n; ++col) {
             for (int row = 0; row < n; ++row) {
-
                 float sum = 0.0f;
 
                 for (int k = 0; k < n; ++k) {
@@ -77,8 +110,12 @@ double forward_error(int n,
     const double diff_norm = std::sqrt(diff2);
     const double ref_norm  = std::sqrt(ref2);
 
-    if (ref_norm > 0.0)
+    if (!std::isfinite(diff_norm) || !std::isfinite(ref_norm)) {
+        return INFINITY;
+    }
+    if (ref_norm > 0.0) {
         return diff_norm / (n * ref_norm);
+    }
 
     return (diff_norm == 0.0) ? 0.0 : INFINITY;
 }
@@ -95,14 +132,8 @@ double max_batch_forward_error(int n,
     double max_error = 0.0;
 
     for (int b = 0; b < batch_size; ++b) {
-
         const size_t base = (size_t)b * matrix_size;
-
-        const double e =
-            forward_error(n,
-                          result + base,
-                          reference + base);
-
+        const double e = forward_error(n, result + base, reference + base);
         max_error = std::max(max_error, e);
     }
 
@@ -117,9 +148,7 @@ int main(int argc, char** argv)
     const int repeats = 100;
 
     if (n <= 0 || n > 32 || batch_size <= 0) {
-
         std::fprintf(stderr, "Usage: %s matrix_size(1..32) batch_size\n", argv[0]);
-
         return EXIT_FAILURE;
     }
 
@@ -141,18 +170,22 @@ int main(int argc, char** argv)
         h_B[i] = std::cos(0.017f * (float)(i + 1));
     }
 
-    // ref. CPU GEMM
+    // CPU reference result.
     batched_gemm_cpu(n, batch_size, h_A.data(), h_B.data(), h_ref.data());
 
     // --------------------------------------------------------
     // Allocate GPU memory
     // --------------------------------------------------------
-    // TODO: write your allocations here
+    float *d_A = nullptr, *d_B = nullptr, *d_C = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_A, bytes));
+    CUDA_CHECK(cudaMalloc(&d_B, bytes));
+    CUDA_CHECK(cudaMalloc(&d_C, bytes));
 
     // --------------------------------------------------------
     // Copy A and B to GPU
     // --------------------------------------------------------
-    // TODO: write your mem-copies here
+    CUDA_CHECK(cudaMemcpy(d_A, h_A.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, h_B.data(), bytes, cudaMemcpyHostToDevice));
 
     // --------------------------------------------------------
     // GPU information
@@ -160,8 +193,8 @@ int main(int argc, char** argv)
     int device = 0;
     cudaDeviceProp prop;
 
-    cudaGetDevice(&device);
-    cudaGetDeviceProperties(&prop, device);
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
     std::printf("GPU: %s (compute capability %d.%d)\n",
                 prop.name, prop.major, prop.minor);
@@ -175,62 +208,74 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // CUDA events
     // --------------------------------------------------------
-    // TODO: create CUDA events for timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
     // --------------------------------------------------------
     // Custom kernel configuration
     // --------------------------------------------------------
-    // TODO: configure your kernel here
-
+    const dim3 block(n, n);
+    const dim3 grid(batch_size);
 
     // --------------------------------------------------------
-    // Warmup run
+    // Custom kernel: warm-up and timing
     // --------------------------------------------------------
-    // TODO: run your kernel once (warmup - not timed)
+    batch_gemm_kernel<<<grid, block>>>(n, batch_size, d_A, d_B, d_C);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaDeviceSynchronize();
-
-    // TODO: start your timing here using CUDA events
-
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
-        // TODO: run your kernel here
+        batch_gemm_kernel<<<grid, block>>>(n, batch_size, d_A, d_B, d_C);
     }
 
-    // TODO: end your timing here using CUDA events
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float custom_ms = 0.0f;
-    // TODO: calculate the time of your kernel using 'cudaEventElapsedTime'
+    CUDA_CHECK(cudaEventElapsedTime(&custom_ms, start, stop));
 
     const double custom_us = custom_ms * 1000.0 / repeats;
 
-
-    // TODO: copy the output matrices to CPU in 'h_custom'
+    CUDA_CHECK(cudaMemcpy(h_custom.data(), d_C, bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // cuBLAS strided batched GEMM
     // --------------------------------------------------------
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    // Keep the comparison in full FP32, without reduced-precision math.
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH));
+    const float alpha = 1.0f, beta = 0.0f;
+    // Strides are measured in elements, not bytes.
+    const long long stride = (long long)matrix_size;
 
-    // TODO: create a cuBLAS handle
+    CUBLAS_CHECK(cublasSgemmStridedBatched(
+        handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+        &alpha, d_A, n, stride, d_B, n, stride,
+        &beta, d_C, n, stride, batch_size));
 
-    // TODO: warmup run for 'cublasSgemmStridedBatched'
-    // TODO: note that the leading dimension for all matrices is 'n'
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaDeviceSynchronize();
-
-    // TODO: start timing using CUDA events
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
-
-        // TODO: call 'cublasSgemmStridedBatched'
+        CUBLAS_CHECK(cublasSgemmStridedBatched(
+            handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+            &alpha, d_A, n, stride, d_B, n, stride,
+            &beta, d_C, n, stride, batch_size));
     }
 
-    // TODO: end timing using CUDA events
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float cublas_ms = 0.0f;
-    // TODO: calculate the time of 'cublasSgemmStridedBatched' using 'cudaEventElapsedTime'
+    CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
 
     const double cublas_us = cublas_ms * 1000.0 / repeats;
 
-    // TODO: copy the output matrices to CPU in 'h_cublas'
+    CUDA_CHECK(cudaMemcpy(h_cublas.data(), d_C, bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // Performance and forward error
@@ -241,12 +286,10 @@ int main(int argc, char** argv)
     const double cublas_gflops = flops / (cublas_us * 1.0e3);
 
     const double custom_error = max_batch_forward_error(
-                                    n, batch_size,
-                                    h_custom.data(), h_ref.data());
+        n, batch_size, h_custom.data(), h_ref.data());
 
     const double cublas_error = max_batch_forward_error(
-                                    n, batch_size,
-                                    h_cublas.data(), h_ref.data());
+        n, batch_size, h_cublas.data(), h_ref.data());
 
     std::printf("%-24s %12s %12s %20s\n",
                 "Implementation",
@@ -269,11 +312,11 @@ int main(int argc, char** argv)
                 cublas_error);
 
     const double tol = 1e-6;
-    if( double(custom_error) <= tol && double(cublas_error) <= tol ) {
+    const bool passed = custom_error <= tol && cublas_error <= tol;
+    if (passed) {
         std::printf("\nTEST PASS\n");
         std::printf("Speedup (cuBLAS time / custom time): %.3fx\n", cublas_us / custom_us);
-    }
-    else {
+    } else {
         std::printf("\nTEST FAIL\n");
         std::printf("Speedup is not calculated\n");
     }
@@ -281,11 +324,12 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // Cleanup
     // --------------------------------------------------------
-    // TODO: Destroy any CUDA events you created
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUBLAS_CHECK(cublasDestroy(handle));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
 
-    // TODO: Destroy any cuBLAS handles you created
-
-    // TODO: free any GPU memory you allocated
-
-    return 0;
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
 }

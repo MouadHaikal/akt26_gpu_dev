@@ -1,4 +1,3 @@
-
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -8,13 +7,41 @@
 #include <cstdlib>
 #include <vector>
 
+#define CUDA_CHECK(call) do { \
+    const cudaError_t status = (call); \
+    if (status != cudaSuccess) { \
+        std::fprintf(stderr, "%s:%d: %s: %s\n", __FILE__, __LINE__, \
+                     #call, cudaGetErrorString(status)); \
+        std::exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+#define CUBLAS_CHECK(call) do { \
+    const cublasStatus_t status = (call); \
+    if (status != CUBLAS_STATUS_SUCCESS) { \
+        std::fprintf(stderr, "%s:%d: %s: cuBLAS error %d\n", \
+                     __FILE__, __LINE__, #call, (int)status); \
+        std::exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
 ////////////////////////////////////////////////////////////////////////////////
 // Custom rank-1 update kernel
 // A <- A + alpha * x * y^T
 // Column-major storage: A(i,j) = A[j*m + i]
-__global__ void ger_kernel(int m, int n, float alpha, const float* x, const float* y, float* A)
+__global__ void ger_kernel(int m, int n, float alpha,
+                           const float* x, const float* y, float* A)
 {
-    // TODO: write your CUDA kernel here
+    const size_t size = (size_t)m * n;
+    const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    // Adjacent threads update adjacent entries in column-major storage.
+    for (size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         index < size; index += stride) {
+        const int row = index % m;
+        const int col = index / m;
+        A[index] += alpha * x[row] * y[col];
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -29,15 +56,15 @@ void ger_cpu(int m, int n, float alpha, const float* x, const float* y, float* A
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// compute error norm
-double compute_error_norm(int size,
+// Relative Frobenius error: ||result - reference||_F / ||reference||_F
+double compute_error_norm(size_t size,
                           const float* result,
                           const float* reference)
 {
     double error = 0.0;
     double norm  = 0.0;
 
-    for (int i = 0; i < size; ++i) {
+    for (size_t i = 0; i < size; ++i) {
         const double diff  = std::fabs((double)result[i] - (double)reference[i]);
         const double denom = std::fabs((double)reference[i]);
 
@@ -45,7 +72,13 @@ double compute_error_norm(int size,
         norm  += denom * denom;
     }
 
-    return sqrt(error) / sqrt(norm);
+    if (!std::isfinite(error) || !std::isfinite(norm)) {
+        return INFINITY;
+    }
+    if (norm == 0.0) {
+        return (error == 0.0) ? 0.0 : INFINITY;
+    }
+    return std::sqrt(error) / std::sqrt(norm);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -93,85 +126,86 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     float *d_x = nullptr, *d_y = nullptr, *d_A = nullptr;
 
-    cudaMalloc(&d_x, (size_t)m * sizeof(float));
-    cudaMalloc(&d_y, (size_t)n * sizeof(float));
-    cudaMalloc(&d_A, matrix_bytes);
+    CUDA_CHECK(cudaMalloc(&d_x, (size_t)m * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y, (size_t)n * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_A, matrix_bytes));
 
-    // copy input vectors from CPU -> GPU
-    cudaMemcpy(d_x, h_x.data(), (size_t)m * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, h_y.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
+    // Copy input vectors from CPU to GPU.
+    CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), (size_t)m * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_y, h_y.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice));
 
     std::printf("Matrix: %d x %d, alpha = %.2f, repeats = %d\n",
                 m, n, alpha, repeats);
     std::printf("Matrix storage: column-major\n\n");
 
-    // n1000: configure your kernel here
-    // TODO: the configuration below is a default that you must change
-    dim3 block(16, 16, 1);
-    dim3 grid( 1, 1, 1);
-    // end of TODO: kernel configuration
+    const dim3 block(256);
+    // Bound the grid size; the kernel's loop covers any remaining elements.
+    const dim3 grid((unsigned int)std::min<size_t>(
+        (matrix_size + block.x - 1) / block.x, 65535));
 
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
     // --------------------------------------------------------
     // Custom kernel: warm-up and timing
     // --------------------------------------------------------
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
     ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Restore the initial matrix before the timed repetitions.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes,
-               cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
         ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float custom_ms = 0.0f;
-    cudaEventElapsedTime(&custom_ms, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&custom_ms, start, stop));
     const double custom_us = custom_ms * 1000.0 / repeats;
 
     // Correctness run: restore initial A and update once.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
     ger_kernel<<<grid, block>>>(m, n, alpha, d_x, d_y, d_A);
-    cudaMemcpy(h_custom.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(h_custom.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // cuBLAS SGER: warm-up and timing
     // --------------------------------------------------------
     cublasHandle_t handle;
-    cublasCreate(&handle);
+    CUBLAS_CHECK(cublasCreate(&handle));
 
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
-    cudaDeviceSynchronize();
+    CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Restore the initial matrix before the timed repetitions.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
 
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventRecord(start));
     for (int r = 0; r < repeats; ++r) {
-        cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
+        CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
     }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
 
     float cublas_ms = 0.0f;
-    cudaEventElapsedTime(&cublas_ms, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
     const double cublas_us = cublas_ms * 1000.0 / repeats;
 
     // Correctness run: restore initial A and update once.
-    cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice);
-    cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m);
-    cudaMemcpy(h_cublas.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(d_A, h_A0.data(), matrix_bytes, cudaMemcpyHostToDevice));
+    CUBLAS_CHECK(cublasSger(handle, m, n, &alpha, d_x, 1, d_y, 1, d_A, m));
+    CUDA_CHECK(cudaMemcpy(h_cublas.data(), d_A, matrix_bytes, cudaMemcpyDeviceToHost));
 
     // --------------------------------------------------------
     // Performance and error norm
@@ -182,8 +216,8 @@ int main(int argc, char** argv)
     const double custom_gflops = flops / (custom_us * 1.0e3);
     const double cublas_gflops = flops / (cublas_us * 1.0e3);
 
-    const double custom_error = compute_error_norm( (int)matrix_size, h_custom.data(), h_ref.data());
-    const double cublas_error = compute_error_norm( (int)matrix_size, h_cublas.data(), h_ref.data());
+    const double custom_error = compute_error_norm(matrix_size, h_custom.data(), h_ref.data());
+    const double cublas_error = compute_error_norm(matrix_size, h_cublas.data(), h_ref.data());
 
     std::printf("%-20s %12s %12s %20s\n",
                 "Implementation", "Time (us)", "GFLOP/s",
@@ -198,11 +232,11 @@ int main(int argc, char** argv)
                 cublas_error);
 
     const double tol = 1e-6;
-    if( double(custom_error) <= tol ) {
+    const bool passed = custom_error <= tol && cublas_error <= tol;
+    if (passed) {
         std::printf("\nTEST PASS\n");
         std::printf("Speedup (cuBLAS time / custom time): %.3fx\n", cublas_us / custom_us);
-    }
-    else {
+    } else {
         std::printf("\nTEST FAIL\n");
         std::printf("Speedup is not calculated\n");
     }
@@ -210,12 +244,12 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // Cleanup
     // --------------------------------------------------------
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    cublasDestroy(handle);
-    cudaFree(d_x);
-    cudaFree(d_y);
-    cudaFree(d_A);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    CUBLAS_CHECK(cublasDestroy(handle));
+    CUDA_CHECK(cudaFree(d_x));
+    CUDA_CHECK(cudaFree(d_y));
+    CUDA_CHECK(cudaFree(d_A));
 
-    return 0;
+    return passed ? EXIT_SUCCESS : EXIT_FAILURE;
 }
